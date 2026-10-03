@@ -243,6 +243,7 @@ export class NulthClient {
   }
 
   buildPaymentAuthProof(context: PaymentAuthContext): NulthProof {
+    assertAuthEntryMatchesContext(context.authEntry, this.config.nulthAccount, context)
     const reservation = this.reserve(context)
     const proof = this.buildPaymentAuthProofUntracked(context)
     // Direct callers retain the original check-and-count behavior.
@@ -276,6 +277,7 @@ export class NulthClient {
 
   /** Build a proof without changing the accumulated spend. */
   buildPaymentAuthProofUntracked(context: PaymentAuthContext): NulthProof {
+    assertAuthEntryMatchesContext(context.authEntry, this.config.nulthAccount, context)
     const bucket = dayBucketFromLedger(context.ledgerSequence)
 
     const authDigest = authDigestFromEntry(context.authEntry)
@@ -494,7 +496,6 @@ export async function prepareNulthSigner(
     address: vault.nulthAccount,
     signAuthEntry: async (authEntry) => {
       const paymentContext = config.paymentContext!
-      assertAuthEntryMatchesContext(authEntry, vault.nulthAccount, paymentContext)
       return {
         signedAuthEntry: encodeAuthSignature(client.buildPaymentAuthProof({ authEntry, ...paymentContext })),
         signerAddress: vault.nulthAccount,
