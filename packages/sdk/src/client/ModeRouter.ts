@@ -12,6 +12,7 @@ import {
   wrapFetchError,
 } from '../errors.js'
 import { withRetry, type RetryPolicy } from '../internal/retry.js'
+import { usdcToStroops } from '../internal/usdc.js'
 import schema from '../schemas/routedock.schema.json' assert { type: 'json' }
 import pkg from '../../package.json' assert { type: 'json' }
 import { verifyManifestSignature } from '../manifest/sign.js'
@@ -54,6 +55,47 @@ function assertManifestActive(manifest: RouteDockManifest, baseUrl: string): voi
   if (sunsetTime <= Date.now()) {
     throw new RouteDockManifestSunsetError(
       `Manifest for provider at ${baseUrl} sunset at ${sunsetAt} and can no longer be used`,
+    )
+  }
+}
+
+/**
+ * Enforce the per-endpoint `deprecated` and `sunset_at` metadata for the URL
+ * being paid. `pay()` never learns the HTTP method, so a path shared by more
+ * than one descriptor (e.g. GET and POST on `/infer`) is refused only when
+ * every matching descriptor has sunset. Paths the manifest does not list keep
+ * today's behavior. Query strings and hashes are ignored because only
+ * `URL.pathname` is compared.
+ */
+export function assertEndpointActive(
+  manifest: RouteDockManifest,
+  url: string,
+  logger?: RouteDockLogger,
+): void {
+  const pathname = new URL(url).pathname
+  const matches = Object.entries(manifest.endpoints).filter(
+    ([, descriptor]) => descriptor.path === pathname,
+  )
+  if (matches.length === 0) return
+
+  const now = Date.now()
+  const allSunset = matches.every(([, descriptor]) => {
+    const sunsetAt = descriptor.sunset_at
+    return typeof sunsetAt === 'string' && Date.parse(sunsetAt) <= now
+  })
+  if (allSunset) {
+    const [key, descriptor] = matches[0]!
+    throw new RouteDockManifestSunsetError(
+      `Endpoint '${key}' (${pathname}) sunset at ${descriptor.sunset_at} and can no longer be used`,
+    )
+  }
+
+  const deprecated = matches.find(([, descriptor]) => descriptor.deprecated === true)
+  if (deprecated && logger) {
+    const [key, descriptor] = deprecated
+    const sunsetSuffix = descriptor.sunset_at ? `; sunset_at ${descriptor.sunset_at}` : ''
+    logger(
+      `[RouteDock] WARNING: ${manifest.name} → ${pathname}; endpoint '${key}' is deprecated${sunsetSuffix}`,
     )
   }
 }
@@ -165,14 +207,21 @@ export function invalidateManifest(baseUrl: string): void {
 
 /**
  * Per-entry freshness from response headers, per RFC 9111:
- * `Cache-Control: max-age` wins over `Expires`, and both win over the
- * default TTL. Missing or unparseable directives fall back to the default
- * TTL (60s). `max-age=0` yields an immediately-stale entry, disabling
+ * `Cache-Control: no-store` and `no-cache` disable caching outright and take
+ * precedence over everything else — the client has no revalidation path, so
+ * `no-cache` (which permits reuse only after revalidation) is treated the
+ * same as `no-store`. Otherwise, `max-age` wins over `Expires`, and both win
+ * over the default TTL. Missing or unparseable directives fall back to the
+ * default TTL (60s). `max-age=0` yields an immediately-stale entry, disabling
  * caching for that response.
  */
 function ttlFromHeaders(headers: Headers, now: number): number {
   const cacheControl = headers.get('cache-control')
   if (cacheControl) {
+    const directives = cacheControl.split(',').map((directive) => directive.trim().toLowerCase())
+    if (directives.includes('no-store') || directives.includes('no-cache')) {
+      return 0
+    }
     const maxAge = /max-age=(\d+)/i.exec(cacheControl)
     if (maxAge) {
       return Number.parseInt(maxAge[1]!, 10) * 1000
@@ -247,9 +296,10 @@ export async function fetchManifest(
 
   return withRetry(async () => {
     let raw: unknown
+    let resp: Response
     let expiresAt = 0
     try {
-      const resp = await fetch(url, { signal: AbortSignal.timeout(manifestTimeoutMs) })
+      resp = await fetch(url, { signal: AbortSignal.timeout(manifestTimeoutMs) })
       if (!resp.ok) {
         if (resp.status >= 500 || resp.status === 429 || resp.status === 503) {
           throw httpStatusToError(
@@ -262,9 +312,6 @@ export async function fetchManifest(
           `Manifest fetch failed: HTTP ${resp.status} from ${url}`,
         )
       }
-      const now = Date.now()
-      expiresAt = now + ttlFromHeaders(resp.headers, now)
-      raw = await resp.json()
     } catch (err) {
       if (err instanceof Error && (err.name === 'TimeoutError' || err.name === 'AbortError')) {
         throw new RouteDockManifestTimeoutError(
@@ -274,6 +321,15 @@ export async function fetchManifest(
       }
       if (err instanceof RouteDockError) throw err
       throw wrapFetchError(err, `Manifest fetch error from ${url}`)
+    }
+
+    const now = Date.now()
+    expiresAt = now + ttlFromHeaders(resp.headers, now)
+
+    try {
+      raw = await resp.json()
+    } catch (err) {
+      throw new RouteDockManifestError(`Manifest at ${url} is not valid JSON`, { cause: err })
     }
 
     const result = validator.validate(raw)
@@ -315,35 +371,48 @@ function selectFromModes(
   }
 
   if (options.optimize === 'cost') {
+    // A caller-supplied ceiling must be a well-formed USDC decimal string.
+    // Validating up front keeps a malformed value ('abc', '$0.01', '') from
+    // parsing to NaN/Infinity and silently disabling the budget guard, which
+    // would let the cheapest mode be selected at any price.
+    let budgetStroops: bigint | null = null
+    if (options.budget_per_request !== undefined) {
+      try {
+        budgetStroops = usdcToStroops(options.budget_per_request)
+      } catch {
+        throw new RouteDockPolicyRejectError('invalid_budget_per_request')
+      }
+    }
+
     const candidates = (['x402', 'mpp-charge'] as Array<'x402' | 'mpp-charge'>)
       .filter((mode) => modes.includes(mode))
-      .map((mode) => {
-        const pricing = manifest.pricing[mode]
-        const amount = pricing?.amount
-        const parsedAmount = typeof amount === 'string' ? Number.parseFloat(amount) : Number.NaN
-        return {
-          mode: mode as PaymentMode,
-          amount: Number.isFinite(parsedAmount) ? parsedAmount : Number.POSITIVE_INFINITY,
+      .flatMap((mode) => {
+        const amount = manifest.pricing[mode]?.amount
+        if (typeof amount !== 'string') return []
+        try {
+          return [{ mode: mode as PaymentMode, amountStroops: usdcToStroops(amount) }]
+        } catch {
+          // Unparseable pricing can't be compared against a budget — drop it.
+          return []
         }
       })
-      .filter((candidate) => Number.isFinite(candidate.amount))
 
     if (candidates.length > 0) {
-      const budget = options.budget_per_request
-        ? Number.parseFloat(options.budget_per_request)
-        : Number.POSITIVE_INFINITY
-      const affordableCandidates = Number.isFinite(budget)
-        ? candidates.filter((candidate) => candidate.amount <= budget)
-        : candidates
+      const affordableCandidates =
+        budgetStroops === null
+          ? candidates
+          : candidates.filter((candidate) => candidate.amountStroops <= budgetStroops)
 
-      const cheapestCandidate = [...affordableCandidates].sort((a, b) => a.amount - b.amount)[0]
+      const cheapestCandidate = [...affordableCandidates].sort((a, b) =>
+        a.amountStroops < b.amountStroops ? -1 : a.amountStroops > b.amountStroops ? 1 : 0,
+      )[0]
       if (cheapestCandidate) {
         return { mode: cheapestCandidate.mode, reason: 'cost-optimized' }
       }
 
       // All candidates exceed the caller's budget ceiling — error instead of
       // silently falling through to an over-budget mode.
-      if (options.budget_per_request !== undefined) {
+      if (budgetStroops !== null) {
         throw new RouteDockPolicyRejectError('budget_per_request_exceeded')
       }
     }
@@ -452,3 +521,4 @@ export function rankProvidersByLatency(
     return 0
   })
 }
+
