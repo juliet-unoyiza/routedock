@@ -492,10 +492,14 @@ export async function prepareNulthSigner(
 
   const signer: NulthStellarSigner = {
     address: vault.nulthAccount,
-    signAuthEntry: async (authEntry) => ({
-      signedAuthEntry: encodeAuthSignature(client.buildPaymentAuthProof({ authEntry, ...config.paymentContext! })),
-      signerAddress: vault.nulthAccount,
-    }),
+    signAuthEntry: async (authEntry) => {
+      const paymentContext = config.paymentContext!
+      assertAuthEntryMatchesContext(authEntry, vault.nulthAccount, paymentContext)
+      return {
+        signedAuthEntry: encodeAuthSignature(client.buildPaymentAuthProof({ authEntry, ...paymentContext })),
+        signerAddress: vault.nulthAccount,
+      }
+    },
   }
   return { signer: signer as ClientStellarSigner, config }
 }
